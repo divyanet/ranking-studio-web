@@ -71,6 +71,30 @@ function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: numbe
   ctx.closePath();
 }
 
+// Shared offscreen canvas for the blurred backdrop. Blurring at full export
+// resolution (1080x1920, ~32px filter) for every frame is very expensive,
+// while a backdrop that is blurred and darkened anyway looks identical when
+// it is rendered small and scaled back up.
+let blurCanvas: HTMLCanvasElement | null = null;
+let blurCtx: CanvasRenderingContext2D | null = null;
+
+function getBlurCanvas(w: number, h: number): { canvas: HTMLCanvasElement; ctx: CanvasRenderingContext2D } | null {
+  try {
+    if (!blurCanvas) {
+      blurCanvas = document.createElement("canvas");
+      blurCtx = blurCanvas.getContext("2d");
+    }
+    if (!blurCtx) return null;
+    if (blurCanvas.width !== w || blurCanvas.height !== h) {
+      blurCanvas.width = w;
+      blurCanvas.height = h;
+    }
+    return { canvas: blurCanvas, ctx: blurCtx };
+  } catch {
+    return null;
+  }
+}
+
 /** Draw the video frame (or a solid placeholder) with Contain / Cover fit. */
 export function drawVideoFrame(
   ctx: CanvasRenderingContext2D,
@@ -105,15 +129,44 @@ export function drawVideoFrame(
 
   if (p.blurBackground) {
     // Same frame, blown up to cover and blurred, behind the main picture.
-    const bScale = Math.max(W / vw, H / vh) * 1.15;
-    const bw = vw * bScale;
-    const bh = vh * bScale;
-    ctx.save();
-    try {
-      (ctx as CanvasRenderingContext2D).filter = `blur(${Math.round(W * 0.03)}px) brightness(0.75)`;
-    } catch { /* ignore */ }
-    ctx.drawImage(video!, (W - bw) / 2, (H - bh) / 2, bw, bh);
-    ctx.restore();
+    // The blur is rendered on a small shared offscreen canvas (~270px wide,
+    // or a quarter of the target width) and drawn scaled up to cover. The
+    // backdrop is blurred + darkened either way, so the result looks the
+    // same - but the blur filter no longer runs at full resolution.
+    const smallW = Math.max(2, Math.min(270, Math.round(W * 0.25)));
+    const smallH = Math.max(2, Math.round((smallW * H) / W));
+    const small = getBlurCanvas(smallW, smallH);
+    if (small) {
+      const sScale = Math.max(smallW / vw, smallH / vh) * 1.15;
+      const sw = vw * sScale;
+      const sh = vh * sScale;
+      const sctx = small.ctx;
+      sctx.save();
+      // Same relative blur strength as before, in small-canvas pixels
+      // (the upscale magnifies it back to full-size strength).
+      try {
+        sctx.filter = `blur(${Math.max(1, Math.round(smallW * 0.03))}px) brightness(0.75)`;
+      } catch { /* ignore */ }
+      sctx.drawImage(video!, (smallW - sw) / 2, (smallH - sh) / 2, sw, sh);
+      sctx.restore();
+      ctx.save();
+      try {
+        (ctx as CanvasRenderingContext2D).filter = "none";
+      } catch { /* ignore */ }
+      ctx.drawImage(small.canvas, 0, 0, smallW, smallH, 0, 0, W, H);
+      ctx.restore();
+    } else {
+      // No offscreen canvas available: fall back to the direct full-size blur.
+      const bScale = Math.max(W / vw, H / vh) * 1.15;
+      const bw = vw * bScale;
+      const bh = vh * bScale;
+      ctx.save();
+      try {
+        (ctx as CanvasRenderingContext2D).filter = `blur(${Math.round(W * 0.03)}px) brightness(0.75)`;
+      } catch { /* ignore */ }
+      ctx.drawImage(video!, (W - bw) / 2, (H - bh) / 2, bw, bh);
+      ctx.restore();
+    }
   }
   ctx.drawImage(video!, dx, dy, dw, dh);
   ctx.restore();

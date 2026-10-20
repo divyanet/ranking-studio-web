@@ -1,9 +1,16 @@
 // In-browser export. Two engines, both 100% client-side:
 //
-// 1) MP4 via WebCodecs + mp4-muxer (v2): the trimmed sequence is rendered
-//    frame-by-frame (offline, faster or slower than realtime depending on
-//    the machine) onto a canvas at the chosen export size, and each frame is
-//    encoded as H.264. The sound is built as one offline Web Audio timeline
+// 1) MP4 via WebCodecs + mp4-muxer (v3): each clip is captured with a
+//    play-and-capture pipeline - the video element seeks ONCE to the trim
+//    start, then plays at an accelerated rate while
+//    requestVideoFrameCallback hands over the presented frames; the latest
+//    presented image is sampled onto a fixed 30fps output timeline
+//    (hold-frame sampling, keyed to each presented frame's mediaTime, so
+//    sync never depends on wall-clock speed). Output frames are drawn onto
+//    a canvas at the chosen export size and encoded as H.264 (hardware
+//    acceleration preferred when the browser offers it). Browsers without
+//    requestVideoFrameCallback keep the older seek-per-frame path. The
+//    sound is built as one offline Web Audio timeline
 //    (each clip's trimmed audio in playback order, with its volume/mute,
 //    plus the background music mixed underneath), encoded to AAC with
 //    WebCodecs AudioEncoder and muxed into the same MP4. Browsers without
@@ -334,19 +341,165 @@ export function exportMp4(p: ProjectState, onProgress: (pr: ExportProgress) => v
       output: (chunk, meta) => { videoChunks.push({ chunk, meta }); },
       error: (e) => { encoderError = e instanceof Error ? e : new Error(String(e)); },
     });
-    encoder.configure({
-      codec: "avc1.640033", // High profile, level 5.1 - covers 1080x1920
-      width: W,
-      height: H,
-      bitrate: 10_000_000,
-      framerate: FPS,
-    });
+    {
+      // Prefer a hardware encoder when the browser offers one; fall back to
+      // the plain config when that combination is not supported.
+      const plainConfig: VideoEncoderConfig = {
+        codec: "avc1.640033", // High profile, level 5.1 - covers 1080x1920
+        width: W,
+        height: H,
+        bitrate: 10_000_000,
+        framerate: FPS,
+      };
+      let chosenConfig = plainConfig;
+      try {
+        const hwConfig: VideoEncoderConfig = { ...plainConfig, hardwareAcceleration: "prefer-hardware" };
+        const support = await VideoEncoder.isConfigSupported(hwConfig);
+        if (support.supported) chosenConfig = hwConfig;
+      } catch { /* keep the plain config */ }
+      encoder.configure(chosenConfig);
+    }
 
     const totalFrames = seq.reduce((sum, r) => {
       const s = slotByRank(p, r);
       return sum + Math.max(1, Math.round((s ? trimmedLength(s) : 0) * FPS));
     }, 0);
     let frameIndex = 0;
+
+    // ---- frame emission, shared by the capture and seek render paths ----
+    const drainEncoder = async (ceiling: number) => {
+      // Backpressure: when the encoder queue is flooded, wait for it to
+      // drain instead of piling on more frames.
+      while (encoder.encodeQueueSize > ceiling) {
+        if (cancelled) throw new Error("Export cancelled.");
+        if (encoderError) throw encoderError;
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    };
+
+    const emitFrame = async (video: HTMLVideoElement, rank: number, pos: number) => {
+      if (cancelled) throw new Error("Export cancelled.");
+      if (encoderError) throw encoderError;
+      if (encoder.encodeQueueSize > 30) await drainEncoder(12);
+      drawVideoFrame(ctx, video, p, W, H);
+      drawOverlay(ctx, p, W, H, { activeRank: rank, sequencePos: pos });
+      const frame = new VideoFrame(canvas, {
+        timestamp: Math.round((frameIndex * 1_000_000) / FPS),
+        duration: Math.round(1_000_000 / FPS),
+      });
+      encoder.encode(frame, { keyFrame: frameIndex % (FPS * 2) === 0 });
+      frame.close();
+      frameIndex++;
+    };
+
+    // ---- fallback path: seek once per output frame (the pre-v3 pipeline).
+    // Used only when requestVideoFrameCallback is unavailable.
+    const renderClipBySeeking = async (video: HTMLVideoElement, rank: number, pos: number) => {
+      const slot = slotByRank(p, rank);
+      if (!slot) return;
+      const frames = Math.max(1, Math.round(trimmedLength(slot) * FPS));
+      for (let f = 0; f < frames; f++) {
+        if (cancelled) throw new Error("Export cancelled.");
+        if (encoderError) throw encoderError;
+        await seekTo(video, slot.start + f / FPS);
+        await emitFrame(video, rank, pos);
+        if (f % 5 === 0) onProgress({ phase: `Rendering clip ${pos + 1} of ${seq.length} (MP4)`, ratio: frameIndex / totalFrames });
+      }
+    };
+
+    // ---- v3 fast path: play-and-capture. Seek ONCE to the trim start, then
+    // play at an accelerated rate and sample the presented frames
+    // (requestVideoFrameCallback) onto the fixed 30fps output timeline.
+    // Sync comes from each presented frame's mediaTime, never wall clock:
+    // a slow machine simply presents frames slower.
+    const CAPTURE_RATE = 4;
+    const FRAME_IDLE_TIMEOUT_MS = 5_000;
+    const renderClipByCapture = async (video: HTMLVideoElement, rank: number, pos: number) => {
+      const slot = slotByRank(p, rank);
+      if (!slot) return;
+      const framesNeeded = Math.max(1, Math.round(trimmedLength(slot) * FPS));
+
+      interface RvfcMetadata { mediaTime: number }
+      type RvfcVideo = HTMLVideoElement & {
+        requestVideoFrameCallback: (cb: (now: number, metadata: RvfcMetadata) => void) => number;
+        cancelVideoFrameCallback?: (handle: number) => void;
+      };
+      const vfc = video as RvfcVideo;
+
+      await seekTo(video, slot.start);
+
+      let latestMediaTime = video.currentTime;
+      let hasImage = video.readyState >= 2;
+      let sourceEnded = false;
+      let lastFrameAt = performance.now();
+      let rvfcHandle = 0;
+      let stopped = false;
+
+      const onPresented = (_now: number, metadata: RvfcMetadata) => {
+        if (stopped) return;
+        if (typeof metadata?.mediaTime === "number" && isFinite(metadata.mediaTime)) {
+          latestMediaTime = metadata.mediaTime;
+        } else {
+          latestMediaTime = video.currentTime;
+        }
+        hasImage = true;
+        lastFrameAt = performance.now();
+        if (latestMediaTime >= slot.end - 0.001 || video.ended) sourceEnded = true;
+        rvfcHandle = vfc.requestVideoFrameCallback(onPresented);
+      };
+      const onEnded = () => { sourceEnded = true; };
+      video.addEventListener("ended", onEnded);
+      rvfcHandle = vfc.requestVideoFrameCallback(onPresented);
+
+      let emitted = 0;
+      try {
+        video.muted = true;
+        try { video.playbackRate = CAPTURE_RATE; } catch { /* keep default rate */ }
+        await video.play();
+        // Overall deadline: accelerated playback should finish well inside
+        // this, but a wedged element must never hang the export forever.
+        const deadline = performance.now() + (trimmedLength(slot) / Math.max(0.25, Math.min(CAPTURE_RATE, video.playbackRate || 1))) * 1000 + 15_000;
+        while (emitted < framesNeeded) {
+          if (cancelled) throw new Error("Export cancelled.");
+          if (encoderError) throw encoderError;
+          if (video.ended || video.currentTime >= slot.end - 0.001) sourceEnded = true;
+
+          // Output frames whose source timestamp the latest presented frame
+          // has reached. Frames that arrive late (dropped at 4x) simply make
+          // this jump by more than one - the latest image is held for the
+          // skipped output frames (hold-frame sampling).
+          let target = emitted;
+          if (hasImage) {
+            target = Math.min(framesNeeded, Math.floor((latestMediaTime - slot.start) * FPS + 1e-6) + 1);
+          }
+          if (sourceEnded) target = framesNeeded;
+          while (emitted < target) {
+            await emitFrame(video, rank, pos);
+            emitted++;
+            if (emitted % 5 === 0) onProgress({ phase: `Rendering clip ${pos + 1} of ${seq.length} (MP4)`, ratio: frameIndex / totalFrames });
+          }
+          if (emitted >= framesNeeded) break;
+
+          const now = performance.now();
+          if (now > deadline) break; // safety: fill the rest below
+          if (now - lastFrameAt > FRAME_IDLE_TIMEOUT_MS) break; // no new frame for seconds: treat clip as finished
+          await new Promise((r) => setTimeout(r, 4));
+        }
+        // Clip ended (or stalled): hold the last image for any output frames
+        // that are still owed, so the clip keeps its exact trimmed length.
+        while (emitted < framesNeeded) {
+          await emitFrame(video, rank, pos);
+          emitted++;
+        }
+      } finally {
+        stopped = true;
+        try { vfc.cancelVideoFrameCallback?.(rvfcHandle); } catch { /* ignore */ }
+        video.removeEventListener("ended", onEnded);
+        try { video.pause(); } catch { /* ignore */ }
+      }
+    };
+
+    const hasRvfc = typeof HTMLVideoElement !== "undefined" && "requestVideoFrameCallback" in HTMLVideoElement.prototype;
 
     try {
       for (let pos = 0; pos < seq.length; pos++) {
@@ -355,26 +508,20 @@ export function exportMp4(p: ProjectState, onProgress: (pr: ExportProgress) => v
         const slot = slotByRank(p, rank);
         if (!slot?.url) continue;
         const video = await makeVideo(slot.url);
-        const len = trimmedLength(slot);
-        const frames = Math.max(1, Math.round(len * FPS));
-        for (let f = 0; f < frames; f++) {
-          if (cancelled) throw new Error("Export cancelled.");
-          if (encoderError) throw encoderError;
-          const t = slot.start + f / FPS;
-          await seekTo(video, t);
-          drawVideoFrame(ctx, video, p, W, H);
-          drawOverlay(ctx, p, W, H, { activeRank: rank, sequencePos: pos });
-          const frame = new VideoFrame(canvas, {
-            timestamp: Math.round((frameIndex * 1_000_000) / FPS),
-            duration: Math.round(1_000_000 / FPS),
-          });
-          encoder.encode(frame, { keyFrame: frameIndex % (FPS * 2) === 0 });
-          frame.close();
-          frameIndex++;
-          if (encoder.encodeQueueSize > 6) {
-            await new Promise((r) => setTimeout(r, 0));
+        if (hasRvfc) {
+          const clipStartFrame = frameIndex;
+          try {
+            await renderClipByCapture(video, rank, pos);
+          } catch (e) {
+            if (cancelled || encoderError) throw e;
+            if (frameIndex !== clipStartFrame) throw e;
+            // Playback could not start at all (rare) and none of this clip's
+            // frames were emitted: do this one clip the slow, reliable way
+            // instead of failing the whole export.
+            await renderClipBySeeking(video, rank, pos);
           }
-          if (f % 5 === 0) onProgress({ phase: `Rendering clip ${pos + 1} of ${seq.length} (MP4)`, ratio: frameIndex / totalFrames });
+        } else {
+          await renderClipBySeeking(video, rank, pos);
         }
         video.removeAttribute("src");
         video.load();

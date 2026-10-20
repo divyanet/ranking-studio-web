@@ -1,6 +1,7 @@
 "use client";
 
-// Ranking Studio Web - v2 (MP4 export now includes AAC audio where supported).
+// Ranking Studio Web - v3 (fast MP4 export: play-and-capture pipeline;
+// MP4 includes AAC audio where supported).
 // Original TypeScript/React implementation of the ranking-video workflow:
 // numbered slots -> trim -> style -> sequential preview -> in-browser export.
 
@@ -747,9 +748,12 @@ export default function StudioPage() {
               MP4 audio (AAC) in this browser: <strong>{hasMp4Audio === null ? "checking..." : hasMp4Audio ? "supported" : "not supported here"}</strong>.
             </p>
             <div className="kbd-note">
-              <strong>MP4 (WebCodecs):</strong> rendered frame-by-frame, usually the sharpest result - on browsers with AAC encoding (Chrome and Edge) it <strong>includes clip sound + background music</strong> mixed into the file. If this browser cannot encode AAC audio, the MP4 still exports but without sound, and the result message will say so clearly.<br />
+              <strong>MP4 (WebCodecs):</strong> the fast export - rendered with an accelerated play-and-capture pipeline, usually the sharpest result - on browsers with AAC encoding (Chrome and Edge) it <strong>includes clip sound + background music</strong> mixed into the file. If this browser cannot encode AAC audio, the MP4 still exports but without sound, and the result message will say so clearly.<br />
               <strong>WebM (MediaRecorder):</strong> recorded in realtime while the sequence plays, and it <strong>includes clip sound + background music</strong>. It remains the fallback - and the safe pick for sound in browsers without WebCodecs audio.
             </div>
+            <p className="sub" style={{ marginTop: 10 }}>
+              <strong>Speed note:</strong> MP4 is the fast export. WebM records in realtime, so a WebM export takes as long as the video itself.
+            </p>
             <div className="row" style={{ marginTop: 10 }}>
               <label className="f">Format
                 <select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as typeof exportFormat)}>
