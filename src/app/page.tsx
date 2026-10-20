@@ -749,7 +749,8 @@ export default function StudioPage() {
             </p>
             <div className="kbd-note">
               <strong>MP4 (WebCodecs):</strong> the fast export - rendered with an accelerated play-and-capture pipeline, usually the sharpest result - on browsers with AAC encoding (Chrome and Edge) it <strong>includes clip sound + background music</strong> mixed into the file. If this browser cannot encode AAC audio, the MP4 still exports but without sound, and the result message will say so clearly.<br />
-              <strong>WebM (MediaRecorder):</strong> recorded in realtime while the sequence plays, and it <strong>includes clip sound + background music</strong>. It remains the fallback - and the safe pick for sound in browsers without WebCodecs audio.
+              <strong>WebM (MediaRecorder):</strong> recorded in realtime while the sequence plays, and it <strong>includes clip sound + background music</strong>. It remains the fallback - and the safe pick for sound in browsers without WebCodecs audio.<br />
+              Clip sound is read straight out of the video file in your browser, and every MP4 export checks that the mixed sound is not silent: if the sound in your files could not be read here, the MP4 result will say so clearly and point you to WebM instead of quietly shipping a soundless file.
             </div>
             <p className="sub" style={{ marginTop: 10 }}>
               <strong>Speed note:</strong> MP4 is the fast export. WebM records in realtime, so a WebM export takes as long as the video itself.

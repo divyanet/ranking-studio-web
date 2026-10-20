@@ -10,7 +10,13 @@
 //    a canvas at the chosen export size and encoded as H.264 (hardware
 //    acceleration preferred when the browser offers it). Browsers without
 //    requestVideoFrameCallback keep the older seek-per-frame path. The
-//    sound is built as one offline Web Audio timeline
+//    Clip audio is demuxed from the MP4/MOV container with mp4box and
+//    decoded with WebCodecs AudioDecoder (decodeAudioData cannot read
+//    audio out of video containers in Chrome, and is only a fallback
+//    here); the mixed result is peak-checked so an MP4 never ships
+//    silently silent - if the expected sound is missing, the export
+//    result carries a clear warning instead. The sound itself is built
+//    as one offline Web Audio timeline
 //    (each clip's trimmed audio in playback order, with its volume/mute,
 //    plus the background music mixed underneath), encoded to AAC with
 //    WebCodecs AudioEncoder and muxed into the same MP4. Browsers without
@@ -25,6 +31,8 @@
 // as the live preview in both engines.
 
 import { Muxer, ArrayBufferTarget } from "mp4-muxer";
+import { createFile, MP4BoxBuffer, DataStream } from "mp4box";
+import type { Sample as Mp4Sample, Track as Mp4Track } from "mp4box";
 import { ProjectState, canvasDef, playbackSequence, slotByRank, totalDuration, trimmedLength } from "./types";
 import { drawOverlay, drawVideoFrame } from "./draw";
 
@@ -104,21 +112,346 @@ async function decodeWith(
   }
 }
 
+// ------------------------------------------------- clip audio via mp4box
+// Chrome's decodeAudioData() cannot extract audio from video containers,
+// which is how silent MP4s shipped in v2. The robust path: demux the
+// container with mp4box, hand the encoded audio samples to WebCodecs
+// AudioDecoder, and assemble plain PCM ourselves.
+
+interface DemuxedAudio {
+  samples: Mp4Sample[];
+  codec: string;
+  sampleRate: number;
+  channels: number;
+  entry: unknown;
+}
+
+/** Demux the first audio track out of an MP4-family file. Null when the
+ *  file is not MP4-family or has no audio track. */
+function demuxAudioTrack(raw: ArrayBuffer): DemuxedAudio | null {
+  try {
+    const file = createFile();
+    const found: { track: Mp4Track | null } = { track: null };
+    const samples: Mp4Sample[] = [];
+    let failed = false;
+    file.onError = () => { failed = true; };
+    file.onReady = (info) => {
+      const track = info.audioTracks?.[0] ?? null;
+      found.track = track;
+      if (track) {
+        try {
+          file.setExtractionOptions(track.id, null, { nbSamples: Math.max(1, track.nb_samples || 1000) });
+          file.start();
+        } catch { failed = true; }
+      }
+    };
+    file.onSamples = (_id, _user, batch) => { samples.push(...(batch as Mp4Sample[])); };
+    // mp4box mutates the buffer it is given - hand it a copy so the same
+    // bytes stay usable for the decodeAudioData fallback.
+    file.appendBuffer(MP4BoxBuffer.fromArrayBuffer(raw.slice(0), 0), true);
+    try { file.flush(); } catch { /* ignore */ }
+    const track = found.track;
+    if (failed || !track || samples.length === 0) return null;
+    return {
+      samples,
+      codec: track.codec || "mp4a.40.2",
+      sampleRate: track.audio?.sample_rate || 48000,
+      channels: track.audio?.channel_count || 2,
+      entry: (samples[0] as { description?: unknown })?.description ?? null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Read one MPEG-4 descriptor header (tag + variable length). */
+function readDescriptorHeader(bytes: Uint8Array, pos: number, end: number): { tag: number; len: number; headerSize: number } | null {
+  if (pos >= end) return null;
+  const tag = bytes[pos];
+  let len = 0;
+  let i = pos + 1;
+  for (let n = 0; n < 4 && i < end; n++) {
+    const b = bytes[i++];
+    len = (len << 7) | (b & 0x7f);
+    if (!(b & 0x80)) break;
+  }
+  return { tag, len, headerSize: i - pos };
+}
+
+/** Walk ES_Descriptor -> DecoderConfigDescriptor -> DecoderSpecificInfo
+ *  and return the AudioSpecificConfig bytes, or null. */
+function walkDescriptorsForAsc(bytes: Uint8Array, pos: number, end: number): Uint8Array | null {
+  let p = pos;
+  while (p < end) {
+    const h = readDescriptorHeader(bytes, p, end);
+    if (!h) return null;
+    const contentStart = p + h.headerSize;
+    const contentEnd = Math.min(end, contentStart + h.len);
+    if (h.tag === 0x05) {
+      return bytes.slice(contentStart, contentEnd);
+    }
+    if (h.tag === 0x03) {
+      // ES_Descriptor content: ES_ID(2) + flags(1) + optional fields.
+      let q = contentStart + 2;
+      if (q < contentEnd) {
+        const flags = bytes[q++];
+        if (flags & 0x80) q += 2;
+        if (flags & 0x40) { if (q < contentEnd) q += 1 + bytes[q]; }
+        if (flags & 0x20) q += 2;
+        const inner = walkDescriptorsForAsc(bytes, q, contentEnd);
+        if (inner) return inner;
+      }
+    } else if (h.tag === 0x04) {
+      // DecoderConfigDescriptor content starts with 13 fixed bytes.
+      const inner = walkDescriptorsForAsc(bytes, contentStart + 13, contentEnd);
+      if (inner) return inner;
+    }
+    p = contentEnd;
+  }
+  return null;
+}
+
+/** Pull the AudioSpecificConfig out of a sample entry's esds box. */
+function extractAudioSpecificConfig(entry: unknown): Uint8Array | null {
+  try {
+    const esds = (entry as { esds?: { write?: (s: DataStream) => void } } | null)?.esds;
+    if (!esds?.write) return null;
+    const stream = new DataStream(undefined, 0);
+    esds.write(stream);
+    const bytes = new Uint8Array(stream.buffer as unknown as ArrayBuffer, 0, stream.byteLength);
+    // Box layout: size(4) + type(4) + version/flags(4) + ES_Descriptor...
+    if (bytes.length < 13) return null;
+    const asc = walkDescriptorsForAsc(bytes, 12, bytes.length);
+    return asc && asc.length >= 2 && asc.length <= 64 ? asc : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Convert one decoded AudioData to per-channel Float32 arrays. Tries the
+ *  copyTo format conversion to f32-planar first, then converts manually
+ *  from whatever sample format the decoder produced. */
+function audioDataToPlanar(ad: AudioData): Float32Array[] | null {
+  const frames = ad.numberOfFrames;
+  const channels = ad.numberOfChannels;
+  try {
+    const out: Float32Array[] = [];
+    for (let ch = 0; ch < channels; ch++) {
+      const size = ad.allocationSize({ format: "f32-planar", planeIndex: ch });
+      const buf = new ArrayBuffer(size);
+      ad.copyTo(buf, { format: "f32-planar", planeIndex: ch });
+      out.push(new Float32Array(buf));
+    }
+    return out;
+  } catch { /* fall through to manual conversion */ }
+  try {
+    const fmt = ad.format;
+    if (!fmt) return null;
+    const isPlanar = fmt.endsWith("-planar");
+    const base = fmt.replace("-planar", "");
+    const out: Float32Array[] = Array.from({ length: channels }, () => new Float32Array(frames));
+    const planeCount = isPlanar ? channels : 1;
+    for (let pl = 0; pl < planeCount; pl++) {
+      const size = ad.allocationSize({ planeIndex: pl });
+      const buf = new ArrayBuffer(size);
+      ad.copyTo(buf, { planeIndex: pl });
+      let flat: Float32Array;
+      if (base === "f32") {
+        flat = new Float32Array(buf);
+      } else if (base === "s16") {
+        const src = new Int16Array(buf);
+        flat = new Float32Array(src.length);
+        for (let i = 0; i < src.length; i++) flat[i] = src[i] / 32768;
+      } else if (base === "s32") {
+        const src = new Int32Array(buf);
+        flat = new Float32Array(src.length);
+        for (let i = 0; i < src.length; i++) flat[i] = src[i] / 2147483648;
+      } else if (base === "u8") {
+        const src = new Uint8Array(buf);
+        flat = new Float32Array(src.length);
+        for (let i = 0; i < src.length; i++) flat[i] = (src[i] - 128) / 128;
+      } else {
+        return null;
+      }
+      if (isPlanar) {
+        out[pl].set(flat.subarray(0, frames));
+      } else {
+        for (let i = 0; i < frames; i++) {
+          for (let ch = 0; ch < channels; ch++) {
+            out[ch][i] = flat[i * channels + ch] ?? 0;
+          }
+        }
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+interface PlanarTrack {
+  channels: Float32Array[];
+  sampleRate: number;
+}
+
+/** Decode demuxed audio samples with WebCodecs AudioDecoder into PCM. */
+async function decodeDemuxedAudio(demux: DemuxedAudio): Promise<PlanarTrack | null> {
+  if (typeof window === "undefined" || !("AudioDecoder" in window)) return null;
+  const asc = extractAudioSpecificConfig(demux.entry);
+  const candidates: AudioDecoderConfig[] = [];
+  if (asc) {
+    candidates.push({ codec: demux.codec, sampleRate: demux.sampleRate, numberOfChannels: demux.channels, description: asc });
+  }
+  candidates.push({ codec: demux.codec, sampleRate: demux.sampleRate, numberOfChannels: demux.channels });
+  if (demux.codec.startsWith("mp4a") && demux.codec !== "mp4a.40.2") {
+    candidates.push({ codec: "mp4a.40.2", sampleRate: demux.sampleRate, numberOfChannels: demux.channels });
+  }
+  let config: AudioDecoderConfig | null = null;
+  for (const c of candidates) {
+    try {
+      const support = await AudioDecoder.isConfigSupported(c);
+      if (support.supported) { config = c; break; }
+    } catch { /* try the next shape */ }
+  }
+  if (!config) return null;
+
+  const parts: { frame: number; channels: Float32Array[] }[] = [];
+  let decoderError: Error | null = null;
+  const decoder = new AudioDecoder({
+    output: (ad) => {
+      try {
+        const planar = audioDataToPlanar(ad);
+        if (planar && planar.length) {
+          parts.push({ frame: Math.round((ad.timestamp / 1_000_000) * demux.sampleRate), channels: planar });
+        }
+      } catch { /* skip an undecodable frame */ }
+      ad.close();
+    },
+    error: (e) => { decoderError = e instanceof Error ? e : new Error(String(e)); },
+  });
+  try {
+    decoder.configure(config);
+    for (const sample of demux.samples) {
+      if (decoderError) throw decoderError;
+      if (!sample.data || sample.data.length === 0) continue;
+      const timescale = sample.timescale || demux.sampleRate || 1;
+      decoder.decode(new EncodedAudioChunk({
+        type: sample.is_sync ? "key" : "delta",
+        timestamp: Math.round((sample.cts / timescale) * 1_000_000),
+        duration: Math.round((sample.duration / timescale) * 1_000_000),
+        data: sample.data,
+      }));
+      while (decoder.decodeQueueSize > 24 && !decoderError) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      if (decoderError) throw decoderError;
+    }
+    await decoder.flush();
+    if (decoderError) throw decoderError;
+  } catch {
+    return null;
+  } finally {
+    try { decoder.close(); } catch { /* ignore */ }
+  }
+  if (!parts.length) return null;
+
+  // Assemble the parts onto one timeline by their sample timestamps
+  // (gaps stay zero, overlaps are clipped).
+  const channelCount = Math.max(...parts.map((pt) => pt.channels.length));
+  const baseFrame = Math.min(...parts.map((pt) => pt.frame));
+  const endFrame = Math.max(...parts.map((pt) => pt.frame + (pt.channels[0]?.length ?? 0)));
+  const totalFrames = endFrame - baseFrame;
+  if (totalFrames <= 0) return null;
+  const assembled: Float32Array[] = Array.from({ length: channelCount }, () => new Float32Array(totalFrames));
+  for (const part of parts) {
+    const at = part.frame - baseFrame;
+    part.channels.forEach((chData, ch) => {
+      if (ch >= channelCount) return;
+      const dest = assembled[ch];
+      const writable = Math.min(chData.length, totalFrames - at);
+      if (writable > 0) dest.set(chData.subarray(0, writable), at);
+    });
+  }
+  return { channels: assembled, sampleRate: demux.sampleRate };
+}
+
+/** Simple linear resampler (per channel) between sample rates. */
+function resamplePlanar(channels: Float32Array[], srcRate: number, dstRate: number): Float32Array[] {
+  if (srcRate === dstRate) return channels;
+  const inFrames = channels[0]?.length ?? 0;
+  if (!inFrames) return channels.map(() => new Float32Array(0));
+  const outFrames = Math.max(1, Math.round((inFrames * dstRate) / srcRate));
+  const ratio = srcRate / dstRate;
+  return channels.map((src) => {
+    const out = new Float32Array(outFrames);
+    for (let i = 0; i < outFrames; i++) {
+      const pos = i * ratio;
+      const i0 = Math.floor(pos);
+      const frac = pos - i0;
+      const i1 = Math.min(i0 + 1, inFrames - 1);
+      out[i] = src[i0] * (1 - frac) + src[i1] * frac;
+    }
+    return out;
+  });
+}
+
+/**
+ * Get one clip's full audio track as a 48kHz AudioBuffer: mp4box demux +
+ * AudioDecoder first, decodeAudioData as the fallback. Null = no readable
+ * audio in this browser (the caller tracks that for the warning).
+ */
+async function extractClipTrackBuffer(raw: ArrayBuffer, offline: OfflineAudioContext): Promise<AudioBuffer | null> {
+  const demux = demuxAudioTrack(raw);
+  if (demux) {
+    const planar = await decodeDemuxedAudio(demux);
+    if (planar && planar.channels.length && (planar.channels[0]?.length ?? 0) > 0) {
+      const resampled = resamplePlanar(planar.channels, planar.sampleRate, AUDIO_SAMPLE_RATE);
+      const frames = resampled[0]?.length ?? 0;
+      if (frames > 0) {
+        const buffer = offline.createBuffer(resampled.length, frames, AUDIO_SAMPLE_RATE);
+        resampled.forEach((chData, ch) => buffer.copyToChannel(new Float32Array(chData), ch));
+        return buffer;
+      }
+    }
+  }
+  try {
+    return await offline.decodeAudioData(raw.slice(0));
+  } catch {
+    return null;
+  }
+}
+
+interface TimelineResult {
+  buffer: AudioBuffer;
+  /** Clips whose audio could be read (of the audible ones we tried). */
+  clipOk: number;
+  /** Audible clips (has file, not muted, volume > 0) we tried to read. */
+  clipExpected: number;
+  musicOk: boolean;
+  musicExpected: boolean;
+}
+
 /**
  * Render the whole project sound into one AudioBuffer with OfflineAudioContext:
  * clips in playback sequence, each sliced to its trim range and placed at its
  * timeline offset with volume/mute applied; music mixed underneath (looped
- * to the total length when the project's loop setting is on).
+ * to the total length when the project's loop setting is on). Also tracks
+ * per-source extraction success so the caller can warn honestly when the
+ * expected sound did not make it.
  */
 async function buildAudioTimeline(
   p: ProjectState,
   seq: number[],
   isCancelled: () => boolean,
   onProgress: (pr: ExportProgress) => void,
-): Promise<AudioBuffer> {
+): Promise<TimelineResult> {
   const total = totalDuration(p);
   const frames = Math.max(1, Math.ceil(total * AUDIO_SAMPLE_RATE));
   const offline = new OfflineAudioContext(AUDIO_CHANNELS, frames, AUDIO_SAMPLE_RATE);
+  let clipOk = 0;
+  let clipExpected = 0;
+  let musicOk = false;
+  const musicExpected = !!(p.music.url && p.music.volume > 0);
 
   let offset = 0;
   for (let pos = 0; pos < seq.length; pos++) {
@@ -128,8 +461,17 @@ async function buildAudioTimeline(
     const len = trimmedLength(slot);
     if (len <= 0) continue;
     if (slot.url && !slot.muted && slot.volume > 0) {
+      clipExpected++;
       onProgress({ phase: `Preparing audio - clip ${pos + 1} of ${seq.length} (MP4)`, ratio: 0 });
-      const decoded = await decodeWith(offline, slot.url);
+      let decoded: AudioBuffer | null = null;
+      try {
+        const res = await fetch(slot.url);
+        if (res.ok) {
+          const raw = await res.arrayBuffer();
+          if (raw.byteLength) decoded = await extractClipTrackBuffer(raw, offline);
+        }
+      } catch { decoded = null; }
+      if (decoded) clipOk++;
       if (decoded && slot.start < decoded.duration) {
         const src = offline.createBufferSource();
         src.buffer = decoded;
@@ -149,6 +491,7 @@ async function buildAudioTimeline(
     if (isCancelled()) throw new Error("Export cancelled.");
     onProgress({ phase: "Preparing audio - background music (MP4)", ratio: 0 });
     const decodedMusic = await decodeWith(offline, p.music.url);
+    if (decodedMusic) musicOk = true;
     if (decodedMusic && decodedMusic.duration > 0) {
       const src = offline.createBufferSource();
       src.buffer = decodedMusic;
@@ -165,7 +508,25 @@ async function buildAudioTimeline(
   }
 
   onProgress({ phase: "Mixing audio timeline (MP4)", ratio: 0 });
-  return offline.startRendering();
+  const buffer = await offline.startRendering();
+  return { buffer, clipOk, clipExpected, musicOk, musicExpected };
+}
+
+/** Peak absolute amplitude of a rendered buffer (early-exits on the first
+ *  non-zero sample - this only gates the "is it actually silent?" check). */
+function peakAmplitude(buffer: AudioBuffer): number {
+  let peak = 0;
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    const data = buffer.getChannelData(ch);
+    for (let i = 0; i < data.length; i++) {
+      const v = Math.abs(data[i]);
+      if (v > peak) {
+        peak = v;
+        if (peak > 0) return peak;
+      }
+    }
+  }
+  return peak;
 }
 
 /** Encode a rendered AudioBuffer to AAC chunks with WebCodecs AudioEncoder. */
@@ -250,15 +611,34 @@ async function prepareMp4Audio(
   }
 
   try {
-    const rendered = await buildAudioTimeline(p, seq, isCancelled, onProgress);
+    const timeline = await buildAudioTimeline(p, seq, isCancelled, onProgress);
     if (isCancelled()) throw new Error("Export cancelled.");
+    const expectedAudible = timeline.clipExpected > 0 || timeline.musicExpected;
+    const anyExtractionOk = timeline.clipOk > 0 || timeline.musicOk;
+    const peak = peakAmplitude(timeline.buffer);
+
+    // Never ship a silently-silent MP4 without a warning: when sound was
+    // expected but the mix rendered as digital silence, drop the audio
+    // track and say exactly what happened.
+    if (expectedAudible && peak === 0) {
+      return {
+        hasSources,
+        chunks: [],
+        warning: !anyExtractionOk
+          ? `The sound could not be read from your files in this browser, so the MP4 was exported without sound. ${AAC_FALLBACK_NOTE}`
+          : `The sound in your files rendered silent in this browser, so the MP4 was exported without sound. ${AAC_FALLBACK_NOTE}`,
+      };
+    }
+
     onProgress({ phase: "Encoding audio (AAC)", ratio: 0 });
-    const chunks = await encodeAudioAac(rendered, isCancelled);
+    const chunks = await encodeAudioAac(timeline.buffer, isCancelled);
     if (!chunks.length) {
       return {
         hasSources,
         chunks: [],
-        warning: `Audio encoding produced no sound data, so the MP4 was exported without sound. ${AAC_FALLBACK_NOTE}`,
+        warning: expectedAudible && !anyExtractionOk
+          ? `The sound could not be read from your files in this browser, so the MP4 was exported without sound. ${AAC_FALLBACK_NOTE}`
+          : `Audio encoding produced no sound data, so the MP4 was exported without sound. ${AAC_FALLBACK_NOTE}`,
       };
     }
     return { hasSources, chunks };
@@ -561,6 +941,9 @@ export function exportMp4(p: ProjectState, onProgress: (pr: ExportProgress) => v
     merged.sort((a, b) => (a.timestamp - b.timestamp) || (a.kind === b.kind ? 0 : a.kind === "video" ? -1 : 1));
     for (const item of merged) {
       if (item.kind === "video") muxer.addVideoChunk(item.chunk, item.meta);
+      // item.meta carries the first chunk's decoderConfig (AAC
+      // AudioSpecificConfig) - mp4-muxer needs it to write the audio
+      // track header, and it survives this merge untouched.
       else muxer.addAudioChunk(item.chunk, item.meta);
     }
     muxer.finalize();
