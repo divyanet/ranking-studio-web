@@ -15,7 +15,7 @@ export const metadata: Metadata = {
 };
 
 const FONTS_HREF =
-  "https://fonts.googleapis.com/css2?family=Anton&family=Bangers&family=Barlow+Condensed:wght@500;600;700&family=Inter:wght@400;500;700&family=Montserrat:wght@500;700;800&display=swap";
+  "https://fonts.googleapis.com/css2?family=Anton&family=Bangers&family=Barlow+Condensed:wght@500;600;700&family=Inter:wght@400;500;600;700;800&family=Montserrat:wght@500;700;800&display=swap";
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
